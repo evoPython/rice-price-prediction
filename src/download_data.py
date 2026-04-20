@@ -25,6 +25,21 @@ PRISM_HEADERS = {
     "Referer": "https://prism.philrice.gov.ph/wp-dynamicreports/"
 }
 
+PSA_PALAY_API_URL = "https://openstat.psa.gov.ph/PXWeb/api/v1/en/DB/DB__2E__CS/0012E4EVCP0.px"
+PSA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "en",
+    "Origin": "https://openstat.psa.gov.ph",
+    "Referer": "https://openstat.psa.gov.ph/PXWeb/pxweb/en/DB/DB__2E__CS/0012E4EVCP0.px/?rxid=bdf9d8da-96f1-4100-ae09-18cb3eaeb313",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
+# Regex for exact Region VII match — avoids false-positive on "REGION VIII"
+# \b ensures "VII" is a whole word, so "REGION VIII" is not matched
+REGION_VII_PATTERN = re.compile(r"\bREGION\s+VII\b", re.IGNORECASE)
+
 
 # ==========================================
 # RICE PRICE DOWNLOADER
@@ -227,13 +242,30 @@ def process_fertilizer_data(out_dir: Path):
         return
 
     full_df = pd.concat(all_data, ignore_index=True)
-    region_7_df = full_df[full_df['Region'].str.contains("REGION VII", case=False, na=False)].copy()
+
+    # FIX: Use word-boundary regex so "REGION VII" does not match "REGION VIII"
+    region_7_df = full_df[
+        full_df['Region'].str.contains(REGION_VII_PATTERN, na=False)
+    ].copy()
 
     if region_7_df.empty:
         console.print("[yellow]No Region VII data found after extraction.[/yellow]")
         return
 
-    region_7_provinces = region_7_df[~region_7_df['Province'].isin(['Regional Summary', 'Regional Average'])]
+    # Filter to non-summary rows, then strictly to Cebu province only
+    region_7_provinces = region_7_df[
+        ~region_7_df['Province'].isin(['Regional Summary', 'Regional Average'])
+    ].copy()
+
+    # Strict Cebu match: strip, uppercase, exact equality
+    region_7_provinces = region_7_provinces[
+        region_7_provinces['Province'].str.strip().str.upper() == 'CEBU'
+    ].copy()
+
+    if region_7_provinces.empty:
+        console.print("[yellow]No Cebu province data found in Region VII.[/yellow]")
+        return
+
     monthly_df = region_7_provinces.groupby(['Year', 'Month', 'Region', 'Province']).agg({
         'Urea_Prilled': 'mean', 'Urea_Granular': 'mean', 'Ammosul': 'mean',
         'Complete': 'mean', 'Ammophos': 'mean', 'MOP': 'mean', 'DAP': 'mean'
@@ -243,10 +275,10 @@ def process_fertilizer_data(out_dir: Path):
     cols = ['Date', 'Year', 'Month', 'Region', 'Province', 'Urea_Prilled', 'Urea_Granular', 'Ammosul', 'Complete', 'Ammophos', 'MOP', 'DAP']
     monthly_df = monthly_df[cols].sort_values(by=["Date", "Province"])
 
-    out_file = out_dir / "region_7_monthly_fertilizer_prices.csv"
+    out_file = out_dir / "cebu_monthly_fertilizer_prices.csv"
     monthly_df.to_csv(out_file, index=False)
 
-    console.print(f"[green]✔ Aggregated Region VII fertilizer data saved to:[/green] {out_file}\n")
+    console.print(f"[green]✔ Cebu (Region VII) fertilizer data saved to:[/green] {out_file}\n")
 
 
 # ==========================================
@@ -308,6 +340,87 @@ def download_yield_data(out_dir: Path):
 
 
 # ==========================================
+# PSA PALAY PRODUCTION DOWNLOADER
+# ==========================================
+def download_palay_production(out_dir: Path):
+    console.rule("[bold green]Downloading PSA Palay Production Data (OpenStat)")
+
+    out_file = out_dir / "palay_production_psa.csv"
+
+    console.print("[cyan]Fetching dataset metadata from PSA OpenStat...[/cyan]")
+
+    try:
+        # Step 1: GET metadata to discover all variable codes and their values
+        meta_r = requests.get(PSA_PALAY_API_URL, headers=PSA_HEADERS, timeout=30)
+        meta_r.raise_for_status()
+        meta = meta_r.json()
+    except Exception as e:
+        console.print(f"[red]Failed to fetch metadata: {e}[/red]")
+        return
+
+    variables = meta.get("variables", [])
+    if not variables:
+        console.print("[red]No variables found in metadata response.[/red]")
+        return
+
+    console.print(f"[cyan]Found [bold]{len(variables)}[/bold] variable(s). Building query for all values...[/cyan]")
+
+    # Step 2: Build a query that selects ALL values for every variable
+    query = {
+        "query": [
+            {
+                "code": var["code"],
+                "selection": {
+                    "filter": "all",
+                    "values": var.get("values", ["*"])
+                }
+            }
+            for var in variables
+        ],
+        "response": {
+            "format": "csv"
+        }
+    }
+
+    console.print("[cyan]Posting query to download full dataset...[/cyan]")
+
+    try:
+        with Progress(
+            TextColumn("[cyan]Downloading palay production CSV"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task("download", total=None)
+
+            dl_r = requests.post(
+                PSA_PALAY_API_URL,
+                json=query,
+                headers={**PSA_HEADERS, "Content-Type": "application/json"},
+                stream=True,
+                timeout=60
+            )
+            dl_r.raise_for_status()
+
+            total = int(dl_r.headers.get("content-length", 0)) or None
+            progress.update(task, total=total)
+
+            with open(out_file, "wb") as f:
+                for chunk in dl_r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        progress.update(task, advance=len(chunk))
+
+    except Exception as e:
+        console.print(f"[red]Failed to download palay production data: {e}[/red]")
+        return
+
+    console.print(f"[green]✔ PSA palay production data saved to:[/green] {out_file}\n")
+
+
+# ==========================================
 # TERMINAL USER INTERFACE (TUI)
 # ==========================================
 def check_overwrite(expected_files: list[Path]) -> bool:
@@ -330,15 +443,16 @@ def main():
 
         menu_text = (
             "[1] Download WFP Rice Price Dataset\n"
-            "[2] Download & Parse FPA Fertilizer Data\n"
+            "[2] Download & Parse FPA Fertilizer Data (Cebu, Region VII)\n"
             "[3] Download PRISM Yield & Rice Area Data\n"
-            "[4] Download & Parse ALL Data\n"
-            f"[5] Change Output Directory (Current: [bold cyan]{out_dir}[/bold cyan])\n"
+            "[4] Download PSA Palay Production Data\n"
+            "[5] Download & Parse ALL Data\n"
+            f"[6] Change Output Directory (Current: [bold cyan]{out_dir}[/bold cyan])\n"
             "[0] Exit"
         )
         console.print(Panel(menu_text, title="🌾 Dataset Downloader", expand=False, border_style="green"))
 
-        choice = Prompt.ask("Select an option", choices=["0", "1", "2", "3", "4", "5"], default="0")
+        choice = Prompt.ask("Select an option", choices=["0", "1", "2", "3", "4", "5", "6"], default="0")
 
         if choice == "0":
             console.print("[cyan]Exiting program. Goodbye![/cyan]")
@@ -350,7 +464,7 @@ def main():
                 download_rice_price(out_dir)
 
         elif choice == "2":
-            target = [out_dir / "region_7_monthly_fertilizer_prices.csv"]
+            target = [out_dir / "cebu_monthly_fertilizer_prices.csv"]
             if check_overwrite(target):
                 process_fertilizer_data(out_dir)
 
@@ -360,18 +474,25 @@ def main():
                 download_yield_data(out_dir)
 
         elif choice == "4":
+            target = [out_dir / "palay_production_psa.csv"]
+            if check_overwrite(target):
+                download_palay_production(out_dir)
+
+        elif choice == "5":
             targets = [
                 out_dir / "wfp_food_prices_phl.csv",
-                out_dir / "region_7_monthly_fertilizer_prices.csv",
+                out_dir / "cebu_monthly_fertilizer_prices.csv",
                 out_dir / "rice_area.csv",
-                out_dir / "yield.csv"
+                out_dir / "yield.csv",
+                out_dir / "palay_production_psa.csv",
             ]
             if check_overwrite(targets):
                 download_rice_price(out_dir)
                 process_fertilizer_data(out_dir)
                 download_yield_data(out_dir)
+                download_palay_production(out_dir)
 
-        elif choice == "5":
+        elif choice == "6":
             new_dir = Prompt.ask("Enter new output directory path")
             out_dir = Path(new_dir).resolve()
             console.print(f"[green]Output directory changed to:[/green] {out_dir}")

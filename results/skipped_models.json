@@ -1,0 +1,4 @@
+{
+  "xgb": "xgboost is not installed. Install the requirements file to train the XGBoost model.",
+  "lstm": "tensorflow is not installed. Install the requirements file to train the LSTM model."
+}

@@ -1,0 +1,31 @@
+{
+  "rows": 277,
+  "columns": 22,
+  "target_col": "price_regular_milled",
+  "year_min": 2000,
+  "year_max": 2025,
+  "missing_pct": {
+    "price_premium": 96.75090252707581,
+    "fert_urea_granular": 96.75090252707581,
+    "fert_dap": 83.03249097472924,
+    "fert_urea_prilled": 81.94945848375451,
+    "fert_mop": 81.94945848375451,
+    "fert_complete": 81.94945848375451,
+    "fert_ammophos": 81.94945848375451,
+    "fert_ammosul": 81.94945848375451,
+    "price_special": 75.45126353790613,
+    "price_well_milled": 75.45126353790613,
+    "avg_yield_ton_per_ha": 68.95306859205776,
+    "rice_area_ha": 68.95306859205776,
+    "tmax": 61.73285198555957,
+    "tmin": 61.73285198555957,
+    "rh": 61.73285198555957,
+    "rainfall": 61.371841155234655,
+    "wind_speed": 61.371841155234655,
+    "price_superior_milled": 45.84837545126354,
+    "price_regular_milled": 12.63537906137184,
+    "month": 0.0,
+    "year": 0.0,
+    "palay_production_mt": 0.0
+  }
+}
