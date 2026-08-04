@@ -42,10 +42,14 @@ from src.data.preprocess import (
     load_cached_preprocessed,
     preprocess,
 )
-from src.models.pipeline import train_all_models, get_all_predictions
+from src.models.pipeline import train_all_models, train_all_models_full, get_all_predictions
 from src.evaluation.evaluate import full_evaluation
 from src.evaluation.report import run_report
 from src.utils.helpers import get_logger, set_seeds
+
+import numpy as np
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
 
 logger = get_logger("main")
 
@@ -54,6 +58,7 @@ PROCESSED_DIR = ROOT_DIR / "data" / "processed"
 FINAL_DIR = ROOT_DIR / "data" / "final"
 MODELS_DIR = ROOT_DIR / "models"
 RESULTS_DIR = ROOT_DIR / "results"
+PREDICTIONS_DIR = RESULTS_DIR / "predictions"
 EDA_DIR = RESULTS_DIR / "eda"
 
 AVAILABLE_TARGETS = [
@@ -81,7 +86,7 @@ def parse_args():
         default="tui",
         choices=[
             "tui", "status", "merge", "preprocess", "eda",
-            "train", "evaluate", "report", "full", "eval-only",
+            "train", "evaluate", "report", "full", "forecast", "eval-only",
         ],
         help="Action to run. Default: tui (interactive menu).",
     )
@@ -200,6 +205,142 @@ def _show_target_completeness(df: pd.DataFrame) -> dict[str, float]:
     print("-" * 60)
     return stats
 
+def _prompt_feature_exclusions(feature_cols: list[str]) -> list[str]:
+    if not feature_cols:
+        return []
+
+    answer = _prompt("Exclude any features from this forecast run? [y/N] ", "n").strip().lower()
+    if answer not in {"y", "yes"}:
+        return []
+
+    print("\nAvailable features:")
+    for col in feature_cols:
+        print(f"  - {col}")
+
+    raw = _prompt("\nType comma-separated feature names to exclude: ", "").strip()
+    if not raw:
+        return []
+
+    requested = [part.strip() for part in raw.split(",") if part.strip()]
+    invalid = [name for name in requested if name not in feature_cols]
+    if invalid:
+        raise ValueError(f"Unknown feature(s): {invalid}")
+
+    return list(dict.fromkeys(requested))
+
+
+def _build_full_training_bundle(
+    df_clean: pd.DataFrame,
+    target_col: str,
+    drop_cols: list[str] | None = None,
+) -> dict:
+    drop_set = {"year", "month", target_col}
+    if drop_cols:
+        drop_set.update(drop_cols)
+
+    feature_cols = [c for c in df_clean.columns if c not in drop_set]
+    if not feature_cols:
+        raise ValueError("No feature columns left after exclusions.")
+
+    X_full_raw = df_clean[feature_cols].apply(pd.to_numeric, errors="coerce").copy()
+    y_full = pd.to_numeric(df_clean[target_col], errors="coerce").copy()
+
+    base_imputer = SimpleImputer(strategy="median")
+    X_full_imputed = pd.DataFrame(
+        base_imputer.fit_transform(X_full_raw),
+        columns=feature_cols,
+        index=df_clean.index,
+    )
+
+    scaler = StandardScaler()
+    X_full_scaled = scaler.fit_transform(X_full_imputed)
+
+    lstm_scaler = StandardScaler()
+    X_lstm_full_scaled = lstm_scaler.fit_transform(X_full_imputed)
+
+    y_scaler = StandardScaler()
+    y_full_scaled = y_scaler.fit_transform(y_full.values.reshape(-1, 1)).ravel()
+
+    return {
+        "X_full": X_full_scaled,
+        "y_full": y_full.values,
+        "X_full_raw": X_full_imputed,
+        "X_lstm_full": X_lstm_full_scaled,
+        "y_lstm_full": y_full_scaled,
+        "y_lstm_full_raw": y_full.values,
+        "scaler": scaler,
+        "lstm_scaler": lstm_scaler,
+        "y_scaler": y_scaler,
+        "feature_names": feature_cols,
+        "imputer": base_imputer,
+        "target_col": target_col,
+    }
+
+
+def _build_future_feature_frame(
+    df_clean: pd.DataFrame,
+    df_original: pd.DataFrame,
+    feature_cols: list[str],
+    start: str = "2026-01-01",
+    end: str = "2027-03-01",
+) -> tuple[pd.DataFrame, dict[str, int]]:
+
+    future_dates = pd.date_range(start=start, end=end, freq="MS")
+
+    # --- HANDLE MONTH SOURCE SAFELY ---
+    # ALWAYS get month from original merged dataset
+    if "month" not in df_original.columns:
+        raise ValueError("Original dataset is missing 'month' column.")
+
+    month_series = pd.to_numeric(df_original["month"], errors="coerce")
+
+    # align length with df_clean (in case rows were dropped during preprocessing)
+    month_series = month_series.loc[df_clean.index]
+
+    df_temp = df_clean.copy()
+    df_temp["_month_tmp"] = month_series
+
+    # --- seasonal medians ---
+    month_medians = (
+        df_temp.groupby("_month_tmp")[feature_cols]
+        .median(numeric_only=True)
+    )
+
+    overall_medians = (
+        df_clean[feature_cols]
+        .apply(pd.to_numeric, errors="coerce")
+        .median(numeric_only=True)
+    )
+
+    fallback_counts = {col: 0 for col in feature_cols}
+    rows: list[dict[str, object]] = []
+
+    for dt in future_dates:
+        row = {"year": int(dt.year), "month": int(dt.month)}
+
+        for col in feature_cols:
+            val = np.nan
+
+            # try seasonal median
+            if dt.month in month_medians.index and col in month_medians.columns:
+                val = month_medians.loc[dt.month, col]
+
+            # fallback: overall median
+            if pd.isna(val):
+                fallback_counts[col] += 1
+                val = overall_medians.get(col, np.nan)
+
+            # fallback: last observed value
+            if pd.isna(val):
+                fallback_counts[col] += 1
+                series = pd.to_numeric(df_clean[col], errors="coerce").dropna()
+                val = float(series.iloc[-1]) if not series.empty else 0.0
+
+            row[col] = float(val)
+
+        rows.append(row)
+
+    return pd.DataFrame(rows), fallback_counts
 
 def choose_target(df: pd.DataFrame, current_target: str = DEFAULT_TARGET) -> str:
     price_cols = _price_columns(df)
@@ -487,6 +628,7 @@ def tui_loop(args, df: pd.DataFrame):
         print("  7) Run full pipeline")
         print("  8) Eval-only from saved artefacts")
         print("  9) Change rice commodity")
+        print(" 10) Full-history forecast (2026–early 2027)")
         print("  0) Exit")
 
         choice = _prompt("Select: ", "9").strip().lower()
@@ -523,6 +665,8 @@ def tui_loop(args, df: pd.DataFrame):
             elif choice == "9":
                 df = _load_or_merge(args, force=False)
                 args.target = choose_target(df, args.target)
+            elif choice == "10":
+                run_forecast_pipeline(args)
             else:
                 print("Unknown selection. Try again.")
         except Exception as exc:
@@ -545,6 +689,74 @@ def run_full_pipeline(args):
     logger.info(f"Dashboard         : {report['dashboard_path']}")
     logger.info("Results saved to  : results/")
 
+def run_forecast_pipeline(args):
+    df = _load_or_merge(args, force=args.force_merge)
+    preprocessed = _load_or_preprocess(df, args, force=args.force_preprocess)
+    df_clean = preprocessed["df_clean"].copy()
+
+    available_features = [c for c in df_clean.columns if c not in {"year", "month", args.target}]
+    excluded_features = _prompt_feature_exclusions(available_features)
+
+    full_bundle = _build_full_training_bundle(
+        df_clean=df_clean,
+        target_col=args.target,
+        drop_cols=excluded_features,
+    )
+
+    models = train_all_models_full(
+        full_bundle,
+        tune=not args.no_tune,
+        n_iter=args.n_iter,
+        lstm_epochs=args.lstm_epochs,
+    )
+
+    print("\n[DEBUG] df_clean columns:")
+    print(df_clean.columns.tolist())
+
+    print("\n[DEBUG] df_clean head:")
+    print(df_clean.head())
+
+    print("\n[DEBUG] df_clean index type:")
+    print(type(df_clean.index))
+
+    future_raw, fallback_counts = _build_future_feature_frame(
+        df_clean=df_clean,
+        df_original=df,  
+        feature_cols=full_bundle["feature_names"],
+    )
+    print("\nFuture-feature imputation summary")
+    print("-" * 60)
+    any_fallback = False
+    for col, count in fallback_counts.items():
+        if count > 0:
+            any_fallback = True
+            print(f"{col:<30} {count:>4} month(s) used fallback medians")
+    if not any_fallback:
+        print("No fallback imputation was needed for the 2026–2027 feature frame.")
+    print("-" * 60)
+
+    X_future_imputed = full_bundle["imputer"].transform(future_raw[full_bundle["feature_names"]])
+    X_future_scaled = full_bundle["scaler"].transform(X_future_imputed)
+    X_lstm_future_scaled = full_bundle["lstm_scaler"].transform(X_future_imputed)
+
+    forecast = future_raw[["year", "month"]].copy()
+    forecast["rf_pred"] = models["rf"]["predict_fn"](X_future_scaled)
+    forecast["xgb_pred"] = models["xgb"]["predict_fn"](X_future_scaled)
+    forecast["hadt_pred"] = models["hadt"]["predict_fn"](X_future_scaled)
+    forecast["lstm_pred"] = models["lstm"]["predict_fn"](X_lstm_future_scaled)
+    forecast["ensemble_pred"] = forecast[["rf_pred", "xgb_pred", "hadt_pred", "lstm_pred"]].mean(axis=1)
+
+    PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = PREDICTIONS_DIR / f"{args.target}_forecast_2026_2027.csv"
+    forecast.to_csv(out_path, index=False)
+
+    logger.info(f"Saved forecast CSV: {out_path}")
+    return {
+        "forecast_path": out_path,
+        "models": models,
+        "forecast": forecast,
+        "excluded_features": excluded_features,
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
@@ -604,6 +816,9 @@ def main():
         return
     if args.mode == "eval-only":
         step_eval_only(args)
+        return
+    if args.mode == "forecast":
+        run_forecast_pipeline(args)
         return
 
 
