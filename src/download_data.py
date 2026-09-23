@@ -36,13 +36,144 @@ PSA_HEADERS = {
     "Pragma": "no-cache",
 }
 
+PSA_RICE_STOCK_SQ_URL = "https://openstat.psa.gov.ph:443/PXWeb/sq/3bb903d6-b28a-4b58-bcb3-905d29ecd300"
+
+PSA_RICE_PRICE_SQ_URL = "https://openstat.psa.gov.ph:443/PXWeb/sq/2a91727a-050a-4bb1-80f4-5ba30383f5d3"
+
 # Regex for exact Region VII match — avoids false-positive on "REGION VIII"
 # \b ensures "VII" is a whole word, so "REGION VIII" is not matched
 REGION_VII_PATTERN = re.compile(r"\bREGION\s+VII\b", re.IGNORECASE)
 
 
 # ==========================================
-# RICE PRICE DOWNLOADER
+# PSA WHOLESALE RICE PRICE DOWNLOADER (current primary source)
+# ==========================================
+def _download_psa_sq(sq_url: str, out_file: Path, title_fragments: list[str],
+                      label: str) -> bool:
+    """
+    Shared best-effort downloader for PSA OpenStat "sq" (saved query)
+    permalinks. See download_rice_price_psa for the verification caveat —
+    this could not be tested against the live endpoint in development.
+    """
+    console.rule(f"[bold green]Downloading {label} (OpenStat)")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        r = requests.get(
+            sq_url,
+            headers={**PSA_HEADERS, "Accept": "text/csv, application/csv, */*"},
+            timeout=30,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        console.print(f"[red]Request failed: {e}[/red]")
+        console.print(
+            "[yellow]Automated download didn't work. Please open the link below, "
+            f"export as CSV, and save it to:[/yellow] {out_file}\n"
+            f"  {sq_url}"
+        )
+        return False
+
+    text_preview = r.text[:200] if r.text else ""
+    looks_valid = all(frag in text_preview for frag in title_fragments)
+
+    if not looks_valid:
+        console.print(
+            "[yellow]Response didn't look like the expected CSV export "
+            "(this endpoint may return an HTML page rather than the raw file "
+            "for a saved-query link). Please download manually instead:[/yellow]\n"
+            f"  {sq_url}\n"
+            f"  → save to: {out_file}"
+        )
+        return False
+
+    out_file.write_bytes(r.content)
+    console.print(f"[green]✔ Saved to:[/green] {out_file}")
+    console.print(
+        "[yellow]Please spot-check this file against a manual export at least once — "
+        "this downloader path is unverified.[/yellow]\n"
+    )
+    return True
+
+
+def download_rice_price_psa(out_dir: Path) -> bool:
+    """
+    Attempts to fetch the PSA OpenStat "Cereals: Wholesale Selling Prices of
+    Agricultural Commodities" saved query (Cebu, Premium/WMR/RMR/Special,
+    2010-present) directly from its PXWeb "sq" permalink.
+
+    IMPORTANT — this could not be verified against the live PSA endpoint in
+    development (network egress to openstat.psa.gov.ph was not available in
+    that environment), so this is a best-effort attempt with a validated
+    fallback, not a confirmed-working scraper. It checks that the response
+    actually looks like the expected export (starts with the known title
+    string) before saving, and clearly tells you to fall back to a manual
+    download if that check fails — please verify the first run manually
+    against the raw file before trusting an automated re-run.
+
+    Manual fallback: open the link below in a browser, export/download as
+    CSV, and save it to data/raw/Price Data/psa_wholesale_rice_prices_cebu.csv
+      https://openstat.psa.gov.ph:443/PXWeb/sq/2a91727a-050a-4bb1-80f4-5ba30383f5d3
+    """
+    out_file = out_dir / "Price Data" / "psa_wholesale_rice_prices_cebu.csv"
+    return _download_psa_sq(
+        PSA_RICE_PRICE_SQ_URL, out_file,
+        title_fragments=["Cereals", "Wholesale"],
+        label="PSA Wholesale Rice Prices",
+    )
+
+
+def download_rice_stock(out_dir: Path) -> bool:
+    """
+    Attempts to fetch the PSA OpenStat "Rice and Corn: Monthly Total Stocks
+    Inventory by Sector" saved query (national, 2010-present) directly from
+    its PXWeb "sq" permalink. Same unverified-in-development caveat as
+    download_rice_price_psa above.
+
+    Manual fallback: open the link below, export as CSV, and save to
+    data/raw/Rice Factors Data/RICE_STOCK_INVENTORY_monthly.csv
+      https://openstat.psa.gov.ph:443/PXWeb/sq/3bb903d6-b28a-4b58-bcb3-905d29ecd300
+    """
+    out_file = out_dir / "Rice Factors Data" / "RICE_STOCK_INVENTORY_monthly.csv"
+    return _download_psa_sq(
+        PSA_RICE_STOCK_SQ_URL, out_file,
+        title_fragments=["Rice and Corn", "Stocks"],
+        label="PSA Rice Stock Inventory",
+    )
+
+
+def download_weather_openmeteo(out_dir: Path) -> bool:
+    """
+    Downloads the Open-Meteo daily archive directly — this one IS a plain,
+    public, no-auth REST API (unlike the PSA endpoints above), so it's a
+    normal GET rather than a best-effort scrape.
+    """
+    console.rule("[bold green]Downloading Open-Meteo Daily Weather Archive")
+    out_file = out_dir / "Weather Data" / "open_meteo_daily_2010_2026.csv"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    url = (
+        "https://archive-api.open-meteo.com/v1/archive"
+        "?latitude=10.3333&longitude=123.75&start_date=2010-01-01"
+        f"&end_date={pd.Timestamp.today().date().isoformat()}"
+        "&daily=temperature_2m_mean,temperature_2m_max,temperature_2m_min,"
+        "precipitation_sum,precipitation_hours,soil_moisture_0_to_100cm_mean"
+        "&timezone=auto&format=csv"
+    )
+    try:
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+    except Exception as e:
+        console.print(f"[red]Request failed: {e}[/red]")
+        return False
+
+    out_file.write_bytes(r.content)
+    console.print(f"[green]✔ Saved to:[/green] {out_file}\n")
+    return True
+
+
+# ==========================================
+# WFP RICE PRICE DOWNLOADER (legacy — superseded by PSA above, kept for reference)
 # ==========================================
 def download_rice_price(out_dir: Path):
     console.rule("[bold green]Downloading WFP Rice Price Dataset")
@@ -442,26 +573,28 @@ def main():
         console.print("\n")
 
         menu_text = (
-            "[1] Download WFP Rice Price Dataset\n"
+            "[1] Download PSA Wholesale Rice Prices (Cebu, primary source)\n"
             "[2] Download & Parse FPA Fertilizer Data (Cebu, Region VII)\n"
             "[3] Download PRISM Yield & Rice Area Data\n"
             "[4] Download PSA Palay Production Data\n"
-            "[5] Download & Parse ALL Data\n"
-            f"[6] Change Output Directory (Current: [bold cyan]{out_dir}[/bold cyan])\n"
+            "[5] Download PSA Rice Stock Inventory (national)\n"
+            "[6] Download Open-Meteo Daily Weather Archive\n"
+            "[7] Download & Parse ALL Data\n"
+            f"[8] Change Output Directory (Current: [bold cyan]{out_dir}[/bold cyan])\n"
             "[0] Exit"
         )
         console.print(Panel(menu_text, title="🌾 Dataset Downloader", expand=False, border_style="green"))
 
-        choice = Prompt.ask("Select an option", choices=["0", "1", "2", "3", "4", "5", "6"], default="0")
+        choice = Prompt.ask("Select an option", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8"], default="0")
 
         if choice == "0":
             console.print("[cyan]Exiting program. Goodbye![/cyan]")
             sys.exit(0)
 
         elif choice == "1":
-            target = [out_dir / "wfp_food_prices_phl.csv"]
+            target = [out_dir / "Price Data" / "psa_wholesale_rice_prices_cebu.csv"]
             if check_overwrite(target):
-                download_rice_price(out_dir)
+                download_rice_price_psa(out_dir)
 
         elif choice == "2":
             target = [out_dir / "cebu_monthly_fertilizer_prices.csv"]
@@ -479,20 +612,34 @@ def main():
                 download_palay_production(out_dir)
 
         elif choice == "5":
+            target = [out_dir / "Rice Factors Data" / "RICE_STOCK_INVENTORY_monthly.csv"]
+            if check_overwrite(target):
+                download_rice_stock(out_dir)
+
+        elif choice == "6":
+            target = [out_dir / "Weather Data" / "open_meteo_daily_2010_2026.csv"]
+            if check_overwrite(target):
+                download_weather_openmeteo(out_dir)
+
+        elif choice == "7":
             targets = [
-                out_dir / "wfp_food_prices_phl.csv",
+                out_dir / "Price Data" / "psa_wholesale_rice_prices_cebu.csv",
                 out_dir / "cebu_monthly_fertilizer_prices.csv",
                 out_dir / "rice_area.csv",
                 out_dir / "yield.csv",
                 out_dir / "palay_production_psa.csv",
+                out_dir / "Rice Factors Data" / "RICE_STOCK_INVENTORY_monthly.csv",
+                out_dir / "Weather Data" / "open_meteo_daily_2010_2026.csv",
             ]
             if check_overwrite(targets):
-                download_rice_price(out_dir)
+                download_rice_price_psa(out_dir)
                 process_fertilizer_data(out_dir)
                 download_yield_data(out_dir)
                 download_palay_production(out_dir)
+                download_rice_stock(out_dir)
+                download_weather_openmeteo(out_dir)
 
-        elif choice == "6":
+        elif choice == "8":
             new_dir = Prompt.ask("Enter new output directory path")
             out_dir = Path(new_dir).resolve()
             console.print(f"[green]Output directory changed to:[/green] {out_dir}")

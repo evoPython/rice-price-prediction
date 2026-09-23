@@ -1,0 +1,21 @@
+Evaluation Summary — price premium
+==================================================
+
+Best model (lowest RMSE): XGB
+  MAE  = ₱1.4126/kg
+  RMSE = ₱2.2974/kg
+  MAPE = 2.56%
+  ME   = ₱+0.3166/kg
+
+Worst model (highest RMSE): HADT
+  RMSE = ₱2.3558/kg
+  MAPE = 2.64%
+
+Model Confidence Set (α=0.10): ['rf', 'xgb', 'hadt', 'naive']
+DM tests significant at 5%: 0 of 6 pairs
+
+Bias (ME) by model:
+  XGB: ₱+0.3166/kg (under-predicts)
+  NAIVE: ₱+0.1568/kg (under-predicts)
+  RF: ₱+0.5543/kg (under-predicts)
+  HADT: ₱+0.2263/kg (under-predicts)

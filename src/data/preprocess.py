@@ -4,13 +4,14 @@ preprocess.py
 Full preprocessing pipeline:
   1. Column selection / target definition
   2. Monthly regularization of the price timeline
-  3. Linear interpolation of price columns only (gaps 1–6 months inclusive)
+  3. Linear interpolation of price columns only (gaps 1–7 months inclusive)
   4. Row-level exclusion of severely incomplete rows
-  5. IQR-based outlier assessment (removal applied only to LSTM training split)
+  5. IQR-based outlier detection; removal (training split only) is optional,
+     controlled by preprocess(..., remove_outliers=...)
   6. Feature scaling (StandardScaler)
   7. Train / test split (80 / 20, chronological)
 
-Output artefacts written to data/final/.
+Output artefacts written to data/final/<target>[/<variant>]/.
 """
 
 from __future__ import annotations
@@ -29,18 +30,23 @@ logger = get_logger(__name__)
 
 FINAL_DIR = Path(__file__).resolve().parents[2] / "data" / "final"
 DEFAULT_TARGET_COL = "price_regular_milled"
-MAX_INTERPOLATION_GAP_MONTHS = 6
+MAX_INTERPOLATION_GAP_MONTHS = 7
 
 
-def get_target_artifact_dir(target_col: str) -> Path:
-    """Returns the artifact directory dedicated to one target commodity."""
-    return FINAL_DIR / target_col
+def get_target_artifact_dir(target_col: str, variant: str | None = None) -> Path:
+    """
+    Returns the artifact directory dedicated to one target commodity, with
+    an optional sub-variant (e.g. "outliers_kept" / "outliers_removed") so
+    multiple experiment runs for the same target don't overwrite each other.
+    """
+    base = FINAL_DIR / target_col
+    return base / variant if variant else base
 
 
-def get_preprocessed_bundle_path(target_col: str | None = None) -> Path:
+def get_preprocessed_bundle_path(target_col: str | None = None, variant: str | None = None) -> Path:
     """Returns the cached preprocessing bundle path for a target commodity."""
     target = target_col or DEFAULT_TARGET_COL
-    return get_target_artifact_dir(target) / "preprocessed_bundle.joblib"
+    return get_target_artifact_dir(target, variant) / "preprocessed_bundle.joblib"
 
 
 # Backward-compatible default path (regular milled).
@@ -187,10 +193,13 @@ def interpolate_price_columns(
 
     weather_cols = [
         "rainfall",
+        "rain_hours",
         "tmax",
         "tmin",
+        "tmean",
         "rh",
         "wind_speed",
+        "soil_moisture",
     ]
 
     cols_to_interp = [
@@ -221,6 +230,46 @@ def interpolate_price_columns(
     return working
 
 
+LAG_MONTHS = (1, 2, 3)
+ROLLING_WINDOW = 3
+
+
+def add_own_price_lag_features(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
+    """
+    Adds autoregressive features derived from the target's own history:
+      own_price_lag1 / lag2 / lag3  – price at t-1, t-2, t-3
+      own_price_roll3               – trailing 3-month mean of price at t-1..t-3
+
+    Only past values are used (shift >= 1), so these are safe to use as
+    predictive features with no lookahead leakage. Computed on the
+    regularized/interpolated monthly timeline, BEFORE any row-completeness
+    filtering, so lag values remain correct relative to true calendar
+    months even if some rows are later dropped for sparsity.
+
+    Also adds `own_price_delta` = target - lag1 (this month's change vs.
+    last month). This is NOT a feature — it is only ever used as an
+    alternative modeling target — and must be excluded from X explicitly.
+    """
+    df = df.copy()
+    if target_col not in df.columns:
+        logger.warning(f"Cannot build lag features: '{target_col}' not in df.")
+        return df
+
+    series = df[target_col]
+    for lag in LAG_MONTHS:
+        df[f"own_price_lag{lag}"] = series.shift(lag)
+
+    df["own_price_roll3"] = series.shift(1).rolling(ROLLING_WINDOW).mean()
+    df["own_price_delta"] = series - series.shift(1)
+
+    logger.info(
+        f"Added own-price lag features: "
+        f"{[f'own_price_lag{l}' for l in LAG_MONTHS]} + own_price_roll3 "
+        f"(own_price_delta kept aside as an alternative target, not a feature)"
+    )
+    return df
+
+
 def _drop_sparse_rows(df: pd.DataFrame, threshold: float = ROW_COMPLETENESS_THRESHOLD) -> pd.DataFrame:
     """Removes rows where the fraction of non-null values is below threshold."""
     before = len(df)
@@ -249,11 +298,11 @@ def _flag_outliers(df: pd.DataFrame, cols: list) -> pd.Series:
     return mask
 
 
-def _save_bundle(bundle: dict, target_col: str) -> Path:
+def _save_bundle(bundle: dict, target_col: str, variant: str | None = None) -> Path:
     """Persist the full preprocessing bundle for later reuse."""
-    artifact_dir = get_target_artifact_dir(target_col)
+    artifact_dir = get_target_artifact_dir(target_col, variant)
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    bundle_path = get_preprocessed_bundle_path(target_col)
+    bundle_path = get_preprocessed_bundle_path(target_col, variant)
     joblib.dump(bundle, bundle_path)
     logger.info(f"Preprocessed bundle saved to {bundle_path}")
     return bundle_path
@@ -281,6 +330,39 @@ def select_features_and_target(
     if drop_cols:
         default_drop += drop_cols
 
+    # Drop sibling rice-grade price columns (e.g. price_well_milled,
+    # price_superior_milled, ...) when they are not the chosen target.
+    # These move in near-lockstep with the target because they're the same
+    # commodity in the same market/month, so leaving them in as "features"
+    # leaks target-adjacent information and lets the model shortcut around
+    # the actual factors (weather, production, fertilizer) we care about.
+    sibling_price_cols = [
+        c for c in df.columns
+        if c.startswith("price_") and c != target_col
+    ]
+    default_drop += sibling_price_cols
+
+    # own_price_delta is target minus lag1 — pure leakage if used as a
+    # feature (it algebraically reveals the target given lag1). It is only
+    # ever used as an alternative *target* elsewhere, never as an X column.
+    default_drop += ["own_price_delta"]
+
+    # Contemporaneous (same-month) rice/headline inflation and rice
+    # contribution figures are dropped by default — they're YoY % change
+    # measures computed FROM that month's own price level, so using them
+    # to predict that same month's price is target-adjacent leakage. Only
+    # the _lag1 versions (last month's published inflation figures) are
+    # kept as legitimate features. See load_rice_inflation() docstring.
+    default_drop += ["headline_inflation", "rice_inflation", "rice_contribution"]
+
+    # Yield and rice area (51% coverage, so ~half of every row's value for
+    # these is median-imputed) were tested via ablation on price_regular_milled
+    # and consistently HURT all three models (RF/XGB/HADT MAPE all rose when
+    # they were included) — removing them was the one consistent, positive
+    # change across models, unlike fertilizer or RH/wind (also sparse, but
+    # ablation showed those net-help despite low coverage, so they're kept).
+    default_drop += ["avg_yield_ton_per_ha", "rice_area_ha"]
+
     feature_cols = [c for c in df.columns
                     if c != target_col and c not in default_drop]
 
@@ -295,11 +377,23 @@ def preprocess(
     df: pd.DataFrame,
     target_col: str,
     drop_cols: list = None,
-    remove_outliers_for_lstm: bool = True,
+    remove_outliers: bool = False,
     save_scaler: bool = True,
+    variant: str | None = None,
 ) -> dict:
     """
     Full preprocessing pipeline.
+
+    Parameters
+    ----------
+    remove_outliers : if True, rows flagged by the IQR rule (on features +
+                       target) are dropped from the TRAINING split only
+                       (never from test — test must reflect real conditions
+                       models will face). Lets you run a clean A/B: same
+                       target, same split, outliers in vs. out.
+    variant         : optional label ("outliers_kept" / "outliers_removed")
+                       appended to the artifact directory so multiple runs
+                       for the same target don't overwrite each other.
 
     Returns
     -------
@@ -308,15 +402,18 @@ def preprocess(
       X_train_raw, X_test_raw                   – unscaled DataFrames (for tree models)
       scaler                                     – fitted StandardScaler
       feature_names                              – list of feature column names
-      outlier_mask                               – boolean Series (True = outlier row)
+      outlier_mask                               – boolean Series (True = outlier row, full dataset)
+      n_outliers_removed_train                   – int, rows dropped from training split
+      remove_outliers                            – bool, echoed back for provenance
       df_clean                                   – cleaned DataFrame before split
-      df_lstm                                    – outlier-removed training DataFrame for LSTM
     """
     FINAL_DIR.mkdir(parents=True, exist_ok=True)
-    artifact_dir = get_target_artifact_dir(target_col)
+    artifact_dir = get_target_artifact_dir(target_col, variant)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=== Preprocessing ===")
+    logger.info(f"Target: {target_col} | variant: {variant or '(default)'} | "
+                f"remove_outliers: {remove_outliers}")
     df = df.copy()
 
     # Keep time order stable for interpolation and splits.
@@ -327,15 +424,16 @@ def preprocess(
     # 1. Drop extremely sparse columns first (they create avoidable NaNs later)
     df = _drop_sparse_columns(df, target_col)
 
-    # 2. Drop extremely sparse rows first (before interpolation to avoid propagation)
-    
-
-    # 3. Regularize the time axis and interpolate price columns only.
+    # 2. Regularize the time axis and interpolate price columns only.
     df = interpolate_price_columns(df, max_gap_months=MAX_INTERPOLATION_GAP_MONTHS)
+
+    # 2b. Add autoregressive (own-price lag / rolling) features on the
+    #     regularized timeline, before row filtering can break contiguity.
+    df = add_own_price_lag_features(df, target_col)
 
     df = _drop_sparse_rows(df)
 
-    # 4. Feature / target split
+    # 3. Feature / target split
     X, y = select_features_and_target(df, target_col, drop_cols)
 
     # Safety net: ensure the target and selected features are finite.
@@ -344,174 +442,92 @@ def preprocess(
     required_cols = list(X.columns) + [target_col]
     df_clean = df_clean.replace([np.inf, -np.inf], np.nan)
 
-    # Keep rows where at least 70% of features exist
+    # Keep rows where at least 50% of features exist
     feature_cols = required_cols[:-1]  # exclude target
-
     min_required = int(0.5 * len(feature_cols))
-
-    valid_rows = (
-        df_clean[feature_cols].notna().sum(axis=1)
-        >= min_required
-    )
-
-    # Still require target to exist
-    valid_rows &= df_clean[target_col].notna()
-
+    valid_rows = df_clean[feature_cols].notna().sum(axis=1) >= min_required
+    valid_rows &= df_clean[target_col].notna()  # still require target to exist
     df_clean = df_clean[valid_rows].reset_index(drop=True)
 
-    logger.info(
-        f"Rows after feature filtering: {len(df_clean)}"
-    )
+    logger.info(f"Rows after feature filtering: {len(df_clean)}")
+    logger.info(f"Target mean: {y.mean():.2f} | std: {y.std():.2f}")
 
-    logger.info(
-        f"Target mean: {y.mean():.2f} | std: {y.std():.2f}"
-    )
-
-    print("Rows after relaxed filtering:", len(df_clean))
     X = df_clean[X.columns].copy()
     y = df_clean[target_col].copy()
 
-    # 5. Outlier detection (IQR) — mask computed on full dataset for reference,
-    #    but removal is applied to the LSTM training split only (see step 6).
+    # 4. Outlier detection (IQR) — mask computed on full dataset for
+    #    reference/reporting regardless of whether removal is applied.
     numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
     outlier_mask = _flag_outliers(df_clean, numeric_features + [target_col])
     n_outliers = outlier_mask.sum()
     logger.info(f"Outliers detected (IQR, multiplier={IQR_MULTIPLIER}): {n_outliers} rows")
 
-    # 6. Train / test split – chronological (no shuffle) ---
-    #    Using sklearn's train_test_split with shuffle=False to respect time order.
-    def _split(X_in, y_in):
-        return train_test_split(
-            X_in, y_in,
-            test_size=TEST_SIZE,
-            shuffle=False,   # preserve time order
-        )
-
-    # Tree-model split (unchanged)
-    X_train_raw, X_test_raw, y_train, y_test = _split(X, y)
-
-    # Split first — same indices as tree models
-    X_lstm_full = df_clean.drop(columns=[target_col])
-    y_lstm_full = df_clean[target_col]
-    X_lstm_train_raw, X_lstm_test, y_lstm_train_raw, y_lstm_test = _split(
-        X_lstm_full, y_lstm_full
+    # 5. Train / test split – chronological (no shuffle), test set NEVER touched by outlier removal.
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, shuffle=False,
     )
 
-    if remove_outliers_for_lstm:
-        train_df_tmp = X_lstm_train_raw.copy()
-        train_df_tmp[target_col] = y_lstm_train_raw.values
-        outlier_mask_train = _flag_outliers(
-            train_df_tmp, numeric_features + [target_col]
-        )
-        n_removed = outlier_mask_train.sum()
+    n_outliers_removed_train = 0
+    if remove_outliers:
+        train_df_tmp = X_train_raw.copy()
+        train_df_tmp[target_col] = y_train.values
+        # Fences computed on the TRAINING split only (not full dataset),
+        # so the test set can never leak into what counts as "normal".
+        outlier_mask_train = _flag_outliers(train_df_tmp, numeric_features + [target_col])
+        n_outliers_removed_train = int(outlier_mask_train.sum())
         logger.info(
-            f"LSTM outlier removal (training only): {n_removed} rows removed "
-            f"({len(X_lstm_train_raw) - n_removed} training rows kept)"
+            f"Removing outliers from training split: {n_outliers_removed_train} rows "
+            f"({len(X_train_raw) - n_outliers_removed_train} kept of {len(X_train_raw)})"
         )
-        X_lstm_train = X_lstm_train_raw[~outlier_mask_train]
-        y_lstm_train = y_lstm_train_raw[~outlier_mask_train]
+        X_train_raw = X_train_raw[~outlier_mask_train.values].reset_index(drop=True)
+        y_train = y_train[~outlier_mask_train.values].reset_index(drop=True)
 
-        # --- FIX: Impute LSTM features properly ---
-
-        lstm_imputer = SimpleImputer(strategy="median")
-
-        X_lstm_train = pd.DataFrame(
-            lstm_imputer.fit_transform(X_lstm_train),
-            columns=X_lstm_train.columns
-        )
-
-        X_lstm_test = pd.DataFrame(
-            lstm_imputer.transform(X_lstm_test),
-            columns=X_lstm_test.columns
-        )
-    else:
-        X_lstm_train = X_lstm_train_raw
-        y_lstm_train = y_lstm_train_raw
-
-    df_lstm = X_lstm_train.copy()
-    df_lstm[target_col] = y_lstm_train.values
-    logger.info(f"LSTM training dataset shape (outliers removed): {df_lstm.shape}")
-    logger.info(f"LSTM test set size: {len(X_lstm_test)} (same as tree models)")
-
+    # 6. Median-impute (fit on train only), then scale (fit on train only)
     imputer = SimpleImputer(strategy="median")
+    X_train_raw = pd.DataFrame(imputer.fit_transform(X_train_raw), columns=X_train_raw.columns)
+    X_test_raw  = pd.DataFrame(imputer.transform(X_test_raw),  columns=X_test_raw.columns)
 
-    X_train_raw = pd.DataFrame(
-        imputer.fit_transform(X_train_raw),
-        columns=X_train_raw.columns
-    )
-
-    X_test_raw = pd.DataFrame(
-        imputer.transform(X_test_raw),
-        columns=X_test_raw.columns
-    )
-
-    # 7. Scaling (StandardScaler fitted on train only)
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train_raw)
     X_test_scaled  = scaler.transform(X_test_raw)
 
-    lstm_scaler = StandardScaler()
-    X_lstm_train_scaled = lstm_scaler.fit_transform(X_lstm_train)
-    X_lstm_test_scaled  = lstm_scaler.transform(X_lstm_test)
-
-    y_scaler = StandardScaler()
-    y_scaler.fit(y_lstm_train_raw.values.reshape(-1, 1))
-    y_lstm_train_scaled = y_scaler.transform(
-        y_lstm_train.values.reshape(-1, 1)
-    ).ravel()
-    y_lstm_test_scaled = y_scaler.transform(
-        y_lstm_test.values.reshape(-1, 1)
-    ).ravel()
-
     if save_scaler:
-        joblib.dump(scaler,      artifact_dir / "scaler.pkl")
-        joblib.dump(lstm_scaler, artifact_dir / "lstm_scaler.pkl")
-        joblib.dump(y_scaler,    artifact_dir / "y_scaler.pkl")
-        logger.info(f"Scalers saved to {artifact_dir}")
+        joblib.dump(scaler, artifact_dir / "scaler.pkl")
+        logger.info(f"Scaler saved to {artifact_dir}")
 
-    # 8. Persist split datasets
+    # 7. Persist split datasets
     pd.DataFrame(X_train_scaled, columns=X.columns).to_csv(artifact_dir / "X_train.csv", index=False)
     pd.DataFrame(X_test_scaled,  columns=X.columns).to_csv(artifact_dir / "X_test.csv",  index=False)
     pd.Series(y_train.values, name=target_col).to_csv(artifact_dir / "y_train.csv", index=False)
     pd.Series(y_test.values,  name=target_col).to_csv(artifact_dir / "y_test.csv",  index=False)
 
     bundle = {
-        # Tree-model splits (scaled)
         "X_train": X_train_scaled,
         "X_test":  X_test_scaled,
         "y_train": y_train.values,
         "y_test":  y_test.values,
-        # Unscaled DataFrames (for SHAP / feature names)
-        "X_train_raw": X_train_raw,
+        "X_train_raw": X_train_raw,   # unscaled DataFrames (for SHAP / tree models)
         "X_test_raw":  X_test_raw,
-        # LSTM-specific splits
-        "X_lstm_train": X_lstm_train_scaled,
-        "X_lstm_test":  X_lstm_test_scaled,
-        "y_lstm_train": y_lstm_train_scaled,
-        "y_lstm_test":  y_lstm_test_scaled,
-        "y_lstm_train_raw": y_lstm_train.values,
-        "y_lstm_test_raw":  y_lstm_test.values,
-        # Metadata
         "scaler":        scaler,
-        "lstm_scaler":   lstm_scaler,
-        "y_scaler":      y_scaler,
         "feature_names": list(X.columns),
         "outlier_mask":  outlier_mask,
+        "n_outliers_removed_train": n_outliers_removed_train,
+        "remove_outliers": remove_outliers,
         "df_clean":      df_clean,
-        "df_lstm":       df_lstm,
         "target_col":    target_col,
+        "variant":       variant,
     }
 
-    _save_bundle(bundle, target_col)
-    logger.info(f"Train/test splits saved to {FINAL_DIR}")
+    _save_bundle(bundle, target_col, variant)
+    logger.info(f"Train/test splits saved to {artifact_dir}")
     logger.info(f"Train size: {len(X_train_raw)} | Test size: {len(X_test_raw)}")
 
     return bundle
 
 
-def load_cached_preprocessed(target_col: str | None = None) -> dict | None:
+def load_cached_preprocessed(target_col: str | None = None, variant: str | None = None) -> dict | None:
     """Loads the saved preprocessing bundle if it exists."""
-    bundle_path = get_preprocessed_bundle_path(target_col)
+    bundle_path = get_preprocessed_bundle_path(target_col, variant)
     if not bundle_path.exists():
         return None
 
@@ -519,12 +535,3 @@ def load_cached_preprocessed(target_col: str | None = None) -> dict | None:
     if target_col is not None and bundle.get("target_col") != target_col:
         return None
     return bundle
-
-
-def reshape_for_lstm(X: np.ndarray, timesteps: int = 1) -> np.ndarray:
-    """
-    Reshapes a 2D array (samples, features) → (samples, timesteps, features)
-    as required by Keras LSTM layers.
-    """
-    samples, features = X.shape
-    return X.reshape(samples, timesteps, features)

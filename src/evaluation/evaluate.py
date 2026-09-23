@@ -17,12 +17,30 @@ from pathlib import Path
 
 from src.evaluation.metrics          import evaluate_all
 from src.evaluation.statistical_tests import run_pairwise_dm, model_confidence_set
-from src.utils.helpers               import get_logger, save_results
+from src.utils.helpers               import get_logger
 
 logger = get_logger(__name__)
 
 RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _save_results_json(results: dict, path: Path):
+    """Serialises a results dict to JSON at an explicit path."""
+    import json
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _default(obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        raise TypeError(f"Type {type(obj)} not serialisable")
+
+    with open(path, "w") as f:
+        json.dump(results, f, indent=2, default=_default)
 
 plt.rcParams.update({
     "figure.dpi":  150,
@@ -36,7 +54,7 @@ plt.rcParams.update({
 # 1. Per-model metrics
 # ---------------------------------------------------------------------------
 
-def evaluate_models(predictions: dict) -> pd.DataFrame:
+def evaluate_models(predictions: dict, results_dir: Path = RESULTS_DIR) -> pd.DataFrame:
     """
     Computes all four metrics for each model.
 
@@ -60,8 +78,9 @@ def evaluate_models(predictions: dict) -> pd.DataFrame:
     logger.info("\n=== Model Metrics ===\n" + df.round(4).to_string())
 
     # Save CSV
-    df.to_csv(RESULTS_DIR / "metrics.csv")
-    logger.info(f"Metrics saved to {RESULTS_DIR / 'metrics.csv'}")
+    results_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(results_dir / "metrics.csv")
+    logger.info(f"Metrics saved to {results_dir / 'metrics.csv'}")
 
     return df
 
@@ -70,7 +89,7 @@ def evaluate_models(predictions: dict) -> pd.DataFrame:
 # 2. Statistical tests
 # ---------------------------------------------------------------------------
 
-def run_statistical_tests(predictions: dict, loss: str = "mse") -> dict:
+def run_statistical_tests(predictions: dict, loss: str = "mse", results_dir: Path = RESULTS_DIR) -> dict:
     """
     Runs DM pairwise tests and MCS.
 
@@ -98,8 +117,9 @@ def run_statistical_tests(predictions: dict, loss: str = "mse") -> dict:
 
     # DM pairwise
     dm_df = run_pairwise_dm(errors, loss=loss)
-    dm_df.to_csv(RESULTS_DIR / "dm_tests.csv", index=False)
-    logger.info(f"DM test results saved to {RESULTS_DIR / 'dm_tests.csv'}")
+    results_dir.mkdir(parents=True, exist_ok=True)
+    dm_df.to_csv(results_dir / "dm_tests.csv", index=False)
+    logger.info(f"DM test results saved to {results_dir / 'dm_tests.csv'}")
     logger.info("\n=== Diebold-Mariano Tests ===\n" + dm_df.to_string(index=False))
 
     # MCS
@@ -121,19 +141,29 @@ def shap_analysis(
     preprocessed: dict,
     feature_names: list,
     max_display: int = 15,
+    results_dir: Path = RESULTS_DIR,
+    n_dependence_features: int = 6,
 ):
     """
-    Computes SHAP values for each model and saves summary plots.
+    Computes SHAP values for each model and saves summary + dependence plots.
 
-    Tree-based models (RF, XGBoost, HADT AdaBoost) → TreeExplainer (fast).
-    LSTM → KernelSHAP on a background sample.
+    Tree-based models (RF, XGBoost) → TreeExplainer (fast, exact).
+    HADT (AdaBoost) isn't supported by TreeExplainer, so it falls back to
+    KernelExplainer on a k-means background summary (slower, model-agnostic,
+    approximate).
 
-    Parameters
-    ----------
-    models       : {model_name: {'model': fitted_model, ...}} from pipeline
-    preprocessed : output of preprocess()
-    feature_names: list of feature column names
-    max_display  : max features to show in plots
+    IMPORTANT — these models predict price DELTA (see pipeline.py), and
+    predictions are reconstructed as last_known_price + predicted_delta.
+    Since that reconstruction just adds a constant per-row offset (last
+    month's actual price, not a model output), a feature's SHAP contribution
+    to the delta prediction is *exactly* its contribution to the final
+    price-level prediction too — so these values can be read directly as
+    "impact on predicted price, in pesos", which is what's shown below.
+
+    Also produces dependence plots for the top `n_dependence_features` by
+    importance per model — feature value (x-axis) vs. SHAP value / ₱
+    impact on predicted price (y-axis) — which show the actual DIRECTION
+    and shape of each feature's effect, not just how important it is.
 
     Returns
     -------
@@ -146,61 +176,82 @@ def shap_analysis(
                        "Run: pip install shap")
         return {}
 
-    shap_dir = RESULTS_DIR / "shap"
+    shap_dir = results_dir / "shap"
     shap_dir.mkdir(parents=True, exist_ok=True)
 
-    X_val = preprocessed["X_train_raw"]   # use training set for SHAP background
-    X_val_np = preprocessed["X_train"]
+    X_val = preprocessed["X_train_raw"]   # use training set for SHAP background (unscaled, for readable axes)
+    X_val_np = preprocessed["X_train"]    # scaled — what the models were actually trained on
 
     shap_importances = {}
+    shap_values_by_model = {}
 
     for name, info in models.items():
         model = info["model"]
+        if name not in ("rf", "xgb", "hadt"):
+            logger.info(f"No SHAP strategy defined for {name}. Skipping.")
+            continue
+
         logger.info(f"Computing SHAP values: {name.upper()} …")
-
         try:
-            if name in ("rf", "xgb", "hadt"):
-                # TreeExplainer for tree-based models
-                explainer = shap.TreeExplainer(
-                    model if name != "hadt" else model.model_
-                )
+            if name in ("rf", "xgb"):
+                explainer = shap.TreeExplainer(model)
                 shap_values = explainer.shap_values(X_val_np)
-
-            elif name == "lstm":
-                # KernelSHAP for LSTM (slower – use a background summary)
-                background = shap.kmeans(X_val_np, 10)
-                X_lstm_test = preprocessed["X_lstm_test"]
-
-                def lstm_wrapper(X):
-                    return info["predict_fn"](X)
-
-                explainer = shap.KernelExplainer(lstm_wrapper, background)
-                # Use a small sample to keep runtime manageable
-                n_samples = min(50, len(X_lstm_test))
-                shap_values = explainer.shap_values(
-                    X_lstm_test[:n_samples], nsamples=100
-                )
+                X_val_np_used = X_val_np
+                X_val_used = X_val
             else:
-                logger.warning(f"No SHAP strategy defined for {name}. Skipping.")
-                continue
+                # HADT (AdaBoostRegressor) isn't TreeExplainer-supported.
+                # KernelExplainer is model-agnostic but O(n_background * n_samples),
+                # so keep both small — fine for this dataset's size.
+                background = shap.kmeans(X_val_np, min(10, len(X_val_np)))
+                n_samples = min(40, len(X_val_np))
+                explainer = shap.KernelExplainer(model.predict, background)
+                shap_values = explainer.shap_values(X_val_np[:n_samples], nsamples=100)
+                X_val_np_used = X_val_np[:n_samples]
+                X_val_used = X_val.iloc[:n_samples]
 
-            # Mean |SHAP| across observations
+            shap_values_by_model[name] = (shap_values, X_val_used)
+
             mean_abs = pd.Series(
                 np.abs(shap_values).mean(axis=0),
                 index=feature_names,
             ).sort_values(ascending=False)
             shap_importances[name] = mean_abs
 
-            # Bar chart
+            # Bar chart — mean |impact on predicted price|, in pesos
             fig, ax = plt.subplots(figsize=(8, 5))
             top = mean_abs.head(max_display)
             ax.barh(top.index[::-1], top.values[::-1], color="steelblue")
-            ax.set_xlabel("Mean |SHAP value|")
+            ax.set_xlabel("Mean |impact on predicted price| (₱/kg)")
             ax.set_title(f"SHAP Feature Importance – {name.upper()}")
             plt.tight_layout()
             fig.savefig(shap_dir / f"shap_{name}.png")
             plt.close(fig)
             logger.info(f"  SHAP plot saved: shap_{name}.png")
+
+            # Dependence plots for the top-N features: feature value vs. actual
+            # ₱ effect on predicted price — shows direction/shape, not just magnitude.
+            top_feats = list(top.index[:n_dependence_features])
+            n_cols = 3
+            n_rows = int(np.ceil(len(top_feats) / n_cols))
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows), squeeze=False)
+            for i, feat in enumerate(top_feats):
+                ax = axes[i // n_cols][i % n_cols]
+                fcol = X_val_used[feat].values
+                svals = shap_values[:, feature_names.index(feat)]
+                ax.scatter(fcol, svals, alpha=0.6, s=20, color="steelblue")
+                ax.axhline(0, color="gray", lw=0.8, ls="--")
+                ax.set_xlabel(feat)
+                ax.set_ylabel("Impact on predicted price (₱/kg)")
+                ax.set_title(feat, fontsize=10)
+            for j in range(len(top_feats), n_rows * n_cols):
+                axes[j // n_cols][j % n_cols].axis("off")
+            fig.suptitle(f"SHAP Dependence — {name.upper()} "
+                         f"(does more of this feature push price up or down, and by how much?)",
+                         fontsize=11, fontweight="bold")
+            plt.tight_layout()
+            fig.savefig(shap_dir / f"shap_dependence_{name}.png")
+            plt.close(fig)
+            logger.info(f"  SHAP dependence plot saved: shap_dependence_{name}.png")
 
         except Exception as e:
             logger.warning(f"SHAP analysis failed for {name}: {e}")
@@ -218,11 +269,11 @@ def shap_analysis(
 # 4. Result Visualisations
 # ---------------------------------------------------------------------------
 
-def plot_predictions(predictions: dict, save: bool = True):
+def plot_predictions(predictions: dict, save: bool = True, results_dir: Path = RESULTS_DIR):
     """
     Actual vs Predicted scatter + time-series line plots for each model.
     """
-    plots_dir = RESULTS_DIR / "plots"
+    plots_dir = results_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     n_models = len(predictions)
@@ -251,11 +302,11 @@ def plot_predictions(predictions: dict, save: bool = True):
     plt.close(fig)
 
 
-def plot_time_series(predictions: dict, save: bool = True):
+def plot_time_series(predictions: dict, save: bool = True, results_dir: Path = RESULTS_DIR):
     """
     Time-series plot of actual prices vs each model's predictions.
     """
-    plots_dir = RESULTS_DIR / "plots"
+    plots_dir = results_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     # Use the test set from the first model as the actual reference
@@ -285,11 +336,11 @@ def plot_time_series(predictions: dict, save: bool = True):
     plt.close(fig)
 
 
-def plot_metrics_comparison(metrics_df: pd.DataFrame, save: bool = True):
+def plot_metrics_comparison(metrics_df: pd.DataFrame, save: bool = True, results_dir: Path = RESULTS_DIR):
     """
     Side-by-side bar chart of MAE, RMSE, MAPE, ME for all models.
     """
-    plots_dir = RESULTS_DIR / "plots"
+    plots_dir = results_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     metric_cols = ["MAE", "RMSE", "MAPE", "ME"]
@@ -330,6 +381,7 @@ def full_evaluation(
     preprocessed: dict,
     feature_names: list,
     run_shap: bool = True,
+    results_dir: Path = RESULTS_DIR,
 ) -> dict:
     """
     Runs the complete evaluation pipeline and saves all artefacts.
@@ -340,7 +392,9 @@ def full_evaluation(
     models        : output of pipeline.train_all_models()
     preprocessed  : output of preprocess.preprocess()
     feature_names : list of feature column names
-    run_shap      : whether to compute SHAP values (can be slow for LSTM)
+    run_shap      : whether to compute SHAP values
+    results_dir   : where to write metrics/plots/shap/json (lets callers
+                    scope output per target / experiment variant)
 
     Returns
     -------
@@ -350,21 +404,23 @@ def full_evaluation(
     logger.info("FULL MODEL EVALUATION")
     logger.info("=" * 60)
 
+    results_dir.mkdir(parents=True, exist_ok=True)
+
     # Metrics
-    metrics_df = evaluate_models(predictions)
+    metrics_df = evaluate_models(predictions, results_dir=results_dir)
 
     # Statistical tests
-    stat_results = run_statistical_tests(predictions)
+    stat_results = run_statistical_tests(predictions, results_dir=results_dir)
 
     # Plots
-    plot_predictions(predictions)
-    plot_time_series(predictions)
-    plot_metrics_comparison(metrics_df)
+    plot_predictions(predictions, results_dir=results_dir)
+    plot_time_series(predictions, results_dir=results_dir)
+    plot_metrics_comparison(metrics_df, results_dir=results_dir)
 
     # SHAP
     shap_importances = {}
     if run_shap:
-        shap_importances = shap_analysis(models, preprocessed, feature_names)
+        shap_importances = shap_analysis(models, preprocessed, feature_names, results_dir=results_dir)
 
     # Persist all results as JSON
     all_results = {
@@ -373,12 +429,12 @@ def full_evaluation(
         "eliminated":  stat_results["mcs_results"]["eliminated"],
         "mcs_p_values":stat_results["mcs_results"]["p_values"],
     }
-    save_results(all_results, "evaluation_results.json")
+    _save_results_json(all_results, results_dir / "evaluation_results.json")
 
     logger.info("=" * 60)
     logger.info(f"Best model (lowest RMSE): {metrics_df['RMSE'].idxmin()}")
     logger.info(f"MCS (top models): {stat_results['mcs_results']['mcs_set']}")
-    logger.info("All results saved to results/")
+    logger.info(f"All results saved to {results_dir}")
     logger.info("=" * 60)
 
     return {

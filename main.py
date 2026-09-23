@@ -42,7 +42,10 @@ from src.data.preprocess import (
     load_cached_preprocessed,
     preprocess,
 )
-from src.models.pipeline import train_all_models, train_all_models_full, get_all_predictions
+from src.models.pipeline import (
+    train_all_models, train_all_models_full, get_all_predictions,
+    LAG1_COL, _make_delta_predict_fn, _make_naive_predict_fn,
+)
 from src.evaluation.evaluate import full_evaluation
 from src.evaluation.report import run_report
 from src.utils.helpers import get_logger, set_seeds
@@ -64,9 +67,9 @@ EDA_DIR = RESULTS_DIR / "eda"
 AVAILABLE_TARGETS = [
     "price_regular_milled",
     "price_well_milled",
-    "price_superior_milled",
     "price_premium",
-    "price_special",
+    "price_special",   # NOT recommended — see load_rice_price_psa() docstring:
+                        # effectively no usable data for Cebu after Jan 2019.
 ]
 DEFAULT_TARGET = "price_regular_milled"
 
@@ -111,12 +114,6 @@ def parse_args():
         help="Skip SHAP feature contribution analysis.",
     )
     parser.add_argument(
-        "--lstm-epochs",
-        type=int,
-        default=100,
-        help="Maximum LSTM training epochs (default: 100).",
-    )
-    parser.add_argument(
         "--n-iter",
         type=int,
         default=20,
@@ -136,6 +133,12 @@ def parse_args():
         "--reuse-cache",
         action="store_true",
         help="Prefer cached merged/preprocessed artefacts when available.",
+    )
+    parser.add_argument(
+        "--remove-outliers",
+        action="store_true",
+        help="Remove IQR outliers from the TRAINING split only (test set is never touched). "
+             "Scopes output to results/<target>/outliers_removed/ instead of outliers_kept/.",
     )
     parser.add_argument(
         "--seed",
@@ -255,9 +258,6 @@ def _build_full_training_bundle(
     scaler = StandardScaler()
     X_full_scaled = scaler.fit_transform(X_full_imputed)
 
-    lstm_scaler = StandardScaler()
-    X_lstm_full_scaled = lstm_scaler.fit_transform(X_full_imputed)
-
     y_scaler = StandardScaler()
     y_full_scaled = y_scaler.fit_transform(y_full.values.reshape(-1, 1)).ravel()
 
@@ -265,11 +265,7 @@ def _build_full_training_bundle(
         "X_full": X_full_scaled,
         "y_full": y_full.values,
         "X_full_raw": X_full_imputed,
-        "X_lstm_full": X_lstm_full_scaled,
-        "y_lstm_full": y_full_scaled,
-        "y_lstm_full_raw": y_full.values,
         "scaler": scaler,
-        "lstm_scaler": lstm_scaler,
         "y_scaler": y_scaler,
         "feature_names": feature_cols,
         "imputer": base_imputer,
@@ -386,13 +382,11 @@ def _artifact_status(target: str) -> dict:
         "x_train": target_dir / "X_train.csv",
         "x_test": target_dir / "X_test.csv",
         "scaler": target_dir / "scaler.pkl",
-        "lstm_scaler": target_dir / "lstm_scaler.pkl",
         "y_scaler": target_dir / "y_scaler.pkl",
         "models": {
             "rf": MODELS_DIR / "rf.pkl",
             "xgb": MODELS_DIR / "xgb.pkl",
             "hadt": MODELS_DIR / "hadt.pkl",
-            "lstm": MODELS_DIR / "lstm.keras",
         },
         "eda_dir": EDA_DIR / target,
         "results_dir": RESULTS_DIR,
@@ -411,7 +405,6 @@ def print_status(df: pd.DataFrame | None = None, target: str = DEFAULT_TARGET) -
     print(f"X_train.csv          : {status['x_train'].name:<24} {_path_status(status['x_train'])}")
     print(f"X_test.csv           : {status['x_test'].name:<24} {_path_status(status['x_test'])}")
     print(f"scaler.pkl           : {status['scaler'].name:<24} {_path_status(status['scaler'])}")
-    print(f"lstm_scaler.pkl      : {status['lstm_scaler'].name:<24} {_path_status(status['lstm_scaler'])}")
     print(f"y_scaler.pkl         : {status['y_scaler'].name:<24} {_path_status(status['y_scaler'])}")
     print("Models:")
     for name, path in status["models"].items():
@@ -440,7 +433,8 @@ def step_merge(force: bool = False):
     return df
 
 
-def step_preprocess(df, target_col: str, reuse_cache: bool = True, force: bool = False) -> dict:
+def step_preprocess(df, target_col: str, reuse_cache: bool = True, force: bool = False,
+                     remove_outliers: bool = False, variant: str | None = None) -> dict:
     logger.info("━" * 55)
     logger.info("STEP 2: Preprocessing")
     logger.info("━" * 55)
@@ -457,13 +451,13 @@ def step_preprocess(df, target_col: str, reuse_cache: bool = True, force: bool =
         target_col = price_cols[0]
 
     if reuse_cache and not force:
-        cached = load_cached_preprocessed(target_col=target_col)
+        cached = load_cached_preprocessed(target_col=target_col, variant=variant)
         if cached is not None:
-            logger.info(f"Using cached preprocessing bundle: {get_preprocessed_bundle_path(target_col)}")
+            logger.info(f"Using cached preprocessing bundle: {get_preprocessed_bundle_path(target_col, variant)}")
             return cached
 
     logger.info(f"Target column: {target_col}")
-    return preprocess(df, target_col=target_col)
+    return preprocess(df, target_col=target_col, remove_outliers=remove_outliers, variant=variant)
 
 
 def step_eda(df, target_col: str):
@@ -481,7 +475,6 @@ def step_train(preprocessed: dict, args) -> dict:
         preprocessed,
         tune=not args.no_tune,
         n_iter=args.n_iter,
-        lstm_epochs=args.lstm_epochs,
     )
 
 
@@ -496,6 +489,7 @@ def step_evaluate(models: dict, preprocessed: dict, args) -> tuple:
         preprocessed=preprocessed,
         feature_names=preprocessed["feature_names"],
         run_shap=not args.no_shap,
+        results_dir=_run_dir(args),
     )
     return results, predictions
 
@@ -508,50 +502,44 @@ def step_report(results: dict, predictions: dict, args) -> dict:
         dm_df=results["dm_results"],
         mcs_result=results["mcs_results"],
         target_col=args.target,
+        report_dir=_run_dir(args) / "report",
     )
 
 
 def step_eval_only(args):
     """Load pre-trained models from models/ and re-run evaluation."""
     import joblib
-    from src.models.train_lstm import predict_lstm
 
     logger.info("━" * 55)
     logger.info("EVAL-ONLY: Loading saved models")
     logger.info("━" * 55)
 
-    cached = load_cached_preprocessed(target_col=args.target)
+    cached = load_cached_preprocessed(target_col=args.target, variant=_variant_label(args))
     if cached is not None:
         preprocessed = cached
         X_test_np = preprocessed["X_test"]
         y_test = preprocessed["y_test"]
         feature_names = preprocessed["feature_names"]
-        X_lstm_test = preprocessed["X_lstm_test"]
-        y_lstm_test = preprocessed["y_lstm_test_raw"]
-        y_scaler = preprocessed["y_scaler"]
-        logger.info(f"Loaded cached preprocessing bundle: {get_preprocessed_bundle_path(args.target)}")
+        lag1_test = preprocessed["X_test_raw"][LAG1_COL].values
+        logger.info(f"Loaded cached preprocessing bundle: {get_preprocessed_bundle_path(args.target, _variant_label(args))}")
     else:
-        target_dir = get_target_artifact_dir(args.target)
+        target_dir = get_target_artifact_dir(args.target, _variant_label(args))
         X_train = pd.read_csv(target_dir / "X_train.csv")
         X_test = pd.read_csv(target_dir / "X_test.csv")
         y_test = pd.read_csv(target_dir / "y_test.csv").values.ravel()
         feature_names = list(X_train.columns)
         X_test_np = X_test.values
         X_train_np = X_train.values
-        y_scaler = joblib.load(target_dir / "y_scaler.pkl")
-        lstm_scaler = joblib.load(target_dir / "lstm_scaler.pkl")
-        X_lstm_test = lstm_scaler.transform(X_test_np)
+        lag1_test = X_test[LAG1_COL].values
         preprocessed = {
             "X_train": X_train_np,
             "X_train_raw": pd.DataFrame(X_train_np, columns=feature_names),
-            "X_lstm_train": lstm_scaler.transform(X_train_np),
-            "X_lstm_test": X_lstm_test,
             "feature_names": feature_names,
-            "y_scaler": y_scaler,
         }
-        y_lstm_test = y_test
         logger.info(f"Loaded fallback CSV splits from {target_dir}")
 
+    # Models were trained on price DELTA and saved as such — reconstruct
+    # price-level predictions the same way pipeline.train_all_models() does.
     models_dict = {}
     predictions = {}
 
@@ -559,34 +547,23 @@ def step_eval_only(args):
         mp = MODELS_DIR / f"{name}.pkl"
         if mp.exists():
             model = joblib.load(mp)
+            predict_fn = _make_delta_predict_fn(model, lag1_test)
             models_dict[name] = {
                 "model": model,
-                "predict_fn": model.predict,
+                "predict_fn": predict_fn,
                 "X_test": X_test_np,
                 "y_test": y_test,
             }
-            predictions[name] = {"y_pred": model.predict(X_test_np), "y_test": y_test}
+            predictions[name] = {"y_pred": predict_fn(X_test_np), "y_test": y_test}
             logger.info(f"Loaded {name.upper()}")
         else:
             logger.warning(f"Not found: {mp}")
 
-    lstm_path = MODELS_DIR / "lstm.keras"
-    if lstm_path.exists():
-        try:
-            import tensorflow as tf
-            lstm_model = tf.keras.models.load_model(str(lstm_path))
-            preds = predict_lstm(lstm_model, X_lstm_test, y_scaler=y_scaler)
-            n = len(preds)
-            predictions["lstm"] = {"y_pred": preds, "y_test": y_lstm_test[:n]}
-            models_dict["lstm"] = {
-                "model": lstm_model,
-                "predict_fn": lambda X: predict_lstm(lstm_model, X, y_scaler),
-                "X_test": X_lstm_test,
-                "y_test": y_lstm_test[:n],
-            }
-            logger.info("Loaded LSTM")
-        except Exception as e:
-            logger.warning(f"Could not load LSTM: {e}")
+    naive_fn = _make_naive_predict_fn(lag1_test)
+    models_dict["naive"] = {
+        "model": None, "predict_fn": naive_fn, "X_test": X_test_np, "y_test": y_test,
+    }
+    predictions["naive"] = {"y_pred": naive_fn(X_test_np), "y_test": y_test}
 
     results = full_evaluation(
         predictions=predictions,
@@ -606,12 +583,23 @@ def _load_or_merge(args, force: bool = False):
     return step_merge(force=force or args.force_merge)
 
 
+def _variant_label(args) -> str:
+    return "outliers_removed" if getattr(args, "remove_outliers", False) else "outliers_kept"
+
+
+def _run_dir(args) -> Path:
+    """Scoped results directory: results/<target>/<outliers_kept|outliers_removed>/"""
+    return RESULTS_DIR / args.target / _variant_label(args)
+
+
 def _load_or_preprocess(df, args, force: bool = False):
     return step_preprocess(
         df,
         args.target,
         reuse_cache=args.reuse_cache,
         force=force or args.force_preprocess,
+        remove_outliers=getattr(args, "remove_outliers", False),
+        variant=_variant_label(args),
     )
 
 
@@ -707,17 +695,7 @@ def run_forecast_pipeline(args):
         full_bundle,
         tune=not args.no_tune,
         n_iter=args.n_iter,
-        lstm_epochs=args.lstm_epochs,
     )
-
-    print("\n[DEBUG] df_clean columns:")
-    print(df_clean.columns.tolist())
-
-    print("\n[DEBUG] df_clean head:")
-    print(df_clean.head())
-
-    print("\n[DEBUG] df_clean index type:")
-    print(type(df_clean.index))
 
     future_raw, fallback_counts = _build_future_feature_frame(
         df_clean=df_clean,
@@ -737,14 +715,23 @@ def run_forecast_pipeline(args):
 
     X_future_imputed = full_bundle["imputer"].transform(future_raw[full_bundle["feature_names"]])
     X_future_scaled = full_bundle["scaler"].transform(X_future_imputed)
-    X_lstm_future_scaled = full_bundle["lstm_scaler"].transform(X_future_imputed)
+
+    # NOTE: models predict price DELTA and are reconstructed here as
+    # last_known_price + predicted_delta. `future_lag1` comes from the
+    # same fallback-imputation as every other future feature (seasonal /
+    # overall median, or last observed value) — it is NOT a true
+    # walk-forward chain where month 2's forecast feeds month 3's lag1.
+    # For a multi-month-ahead forecast that compounds properly, lag1
+    # should be updated iteratively from each month's own prediction;
+    # flagging this as a follow-up rather than doing it silently here.
+    future_lag1 = future_raw[LAG1_COL].values
 
     forecast = future_raw[["year", "month"]].copy()
-    forecast["rf_pred"] = models["rf"]["predict_fn"](X_future_scaled)
-    forecast["xgb_pred"] = models["xgb"]["predict_fn"](X_future_scaled)
-    forecast["hadt_pred"] = models["hadt"]["predict_fn"](X_future_scaled)
-    forecast["lstm_pred"] = models["lstm"]["predict_fn"](X_lstm_future_scaled)
-    forecast["ensemble_pred"] = forecast[["rf_pred", "xgb_pred", "hadt_pred", "lstm_pred"]].mean(axis=1)
+    forecast["rf_pred"] = models["rf"]["predict_fn"](X_future_scaled, lag1=future_lag1)
+    forecast["xgb_pred"] = models["xgb"]["predict_fn"](X_future_scaled, lag1=future_lag1)
+    forecast["hadt_pred"] = models["hadt"]["predict_fn"](X_future_scaled, lag1=future_lag1)
+    forecast["naive_pred"] = future_lag1  # persistence benchmark for the same horizon
+    forecast["ensemble_pred"] = forecast[["rf_pred", "xgb_pred", "hadt_pred"]].mean(axis=1)
 
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = PREDICTIONS_DIR / f"{args.target}_forecast_2026_2027.csv"

@@ -1,21 +1,31 @@
 """
 merge_data.py
 -------------
-Joins all six raw data sources into a single flat DataFrame keyed on
-(year, month).  Uses a left join anchored on the rice price series so
-every row has a target value, and other features are filled in where
-the source data covers that period.
+Joins the rice price series with every current factor source into a single
+flat DataFrame keyed on (year, month). Uses a left join anchored on the rice
+price series so every row has a target value.
 
-Data coverage summary (approximate):
-  WFP rice prices      2000 – 2025   monthly
-  Palay production     1987 – 2025   monthly (expanded from quarterly)
-  Weather (Mactan)     2015 – 2024   monthly
-  Yield (Region VII)   2018 – 2025   monthly (expanded from bi-annual)
-  Rice area (Region VII) 2018 – 2025 monthly (expanded from bi-annual)
-  Fertilizer prices    2021 – 2025   monthly
+  PSA rice prices        2011 – 2026   monthly (Premium / WMR / RMR current to
+                                        most recent published month; Rice
+                                        Special is too sparse to use post-2019)
+  Rice stock (NATIONAL)  2010 – 2026   monthly (not Cebu-specific — PSA doesn't
+                                        publish province-level stock data)
+  Rice inflation (Cebu)  2011 – 2026   monthly (Ricelytics/DA-PhilRice, PSA CPI
+                                        source; contemporaneous columns kept for
+                                        reference, _lag1 versions are the ones
+                                        actually meant to be used as features —
+                                        see load_rice_inflation() docstring)
+  Open-Meteo weather     2010 – 2026   daily → monthly (tmax/tmin/tmean,
+                                        rainfall, rain_hours, soil_moisture)
+  Mactan weather (RH/wind) 2015-2024   monthly (rh, wind_speed only — temp/
+                                        rainfall come from Open-Meteo instead)
+  Palay production       1987 – 2025   monthly (expanded from quarterly)
+  Yield (Region VII)     2018 – 2025   monthly (expanded from bi-annual)
+  Rice area (Region VII) 2018 – 2025   monthly (expanded from bi-annual)
+  Fertilizer prices      2021 – 2025   monthly
 
 Rows where feature columns are NaN are handled downstream in preprocess.py
-via linear interpolation; severely sparse rows are dropped there.
+via linear interpolation; severely sparse rows/columns are dropped there.
 
 Output: data/processed/merged_dataset.csv
 """
@@ -24,12 +34,15 @@ import pandas as pd
 from pathlib import Path
 
 from src.data.load_data import (
-    load_rice_price,
-    load_fertilizer,
+    load_rice_price_psa,
+    load_rice_stock,
+    load_rice_inflation,
+    load_weather_openmeteo,
+    load_weather_mactan_humidity_wind,
     load_palay_production,
     load_yield,
     load_rice_area,
-    load_weather,
+    load_fertilizer,
 )
 from src.utils.helpers import get_logger
 
@@ -40,7 +53,8 @@ PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 
 def merge_datasets(out_path: Path = None) -> pd.DataFrame:
     """
-    Loads every source and left-joins them on (year, month).
+    Loads every current factor source and left-joins them onto the rice
+    price series on (year, month).
 
     Parameters
     ----------
@@ -58,22 +72,28 @@ def merge_datasets(out_path: Path = None) -> pd.DataFrame:
     logger.info("=" * 55)
 
     # ── Load ──────────────────────────────────────────────────
-    rice_df   = load_rice_price()
-    fert_df   = load_fertilizer()
-    palay_df  = load_palay_production()
-    yield_df  = load_yield()
-    area_df   = load_rice_area()
-    weather_df = load_weather()
+    rice_df       = load_rice_price_psa()
+    stock_df      = load_rice_stock()
+    inflation_df  = load_rice_inflation()
+    weather_df    = load_weather_openmeteo()
+    weather_rh_df = load_weather_mactan_humidity_wind()
+    palay_df      = load_palay_production()
+    yield_df      = load_yield()
+    area_df       = load_rice_area()
+    fert_df       = load_fertilizer()
 
     # ── Merge (anchor = rice prices) ──────────────────────────
     merged = rice_df.copy()
 
     for name, df in [
-        ("palay production", palay_df),
-        ("weather",          weather_df),
-        ("yield",            yield_df),
-        ("rice area",        area_df),
-        ("fertilizer",       fert_df),
+        ("rice stock (national)",  stock_df),
+        ("rice inflation (Cebu)",  inflation_df),
+        ("weather (open-meteo)",   weather_df),
+        ("weather (rh/wind)",      weather_rh_df),
+        ("palay production",       palay_df),
+        ("yield",                  yield_df),
+        ("rice area",              area_df),
+        ("fertilizer",             fert_df),
     ]:
         before = len(merged)
         merged = merged.merge(df, on=["year", "month"], how="left")

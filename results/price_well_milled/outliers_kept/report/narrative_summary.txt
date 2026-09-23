@@ -1,0 +1,21 @@
+Evaluation Summary — price well milled
+==================================================
+
+Best model (lowest RMSE): NAIVE
+  MAE  = ₱1.4650/kg
+  RMSE = ₱2.2995/kg
+  MAPE = 2.77%
+  ME   = ₱+0.1818/kg
+
+Worst model (highest RMSE): RF
+  RMSE = ₱2.3445/kg
+  MAPE = 2.78%
+
+Model Confidence Set (α=0.10): ['rf', 'xgb', 'hadt', 'naive']
+DM tests significant at 5%: 0 of 6 pairs
+
+Bias (ME) by model:
+  NAIVE: ₱+0.1818/kg (under-predicts)
+  HADT: ₱+0.2104/kg (under-predicts)
+  XGB: ₱+0.2892/kg (under-predicts)
+  RF: ₱+0.4122/kg (under-predicts)

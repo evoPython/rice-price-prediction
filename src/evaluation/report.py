@@ -46,13 +46,16 @@ plt.rcParams.update({
 })
 
 _PALETTE = {
-    "hadt": "#2563EB",   # blue
-    "xgb":  "#16A34A",   # green
-    "rf":   "#D97706",   # amber
-    "lstm": "#DC2626",   # red
-    "actual": "#111827", # near-black
+    "hadt":  "#2563EB",   # blue
+    "xgb":   "#16A34A",   # green
+    "rf":    "#D97706",   # amber
+    "naive": "#6B7280",   # gray – persistence benchmark
+    "actual": "#111827",  # near-black
 }
-_LABEL = {"hadt": "HADT", "xgb": "XGBoost", "rf": "Random Forest", "lstm": "LSTM"}
+_LABEL = {
+    "hadt": "HADT", "xgb": "XGBoost", "rf": "Random Forest",
+    "naive": "Naive (persistence)",
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -66,6 +69,7 @@ def generate_report_figures(
     mcs_result:  dict,
     target_col:  str = "price_well_milled",
     save:        bool = True,
+    report_dir:  Path = REPORT_DIR,
 ) -> Path:
     """
     Builds a six-panel dashboard PNG:
@@ -78,7 +82,7 @@ def generate_report_figures(
 
     Returns the path to the saved PNG.
     """
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    report_dir.mkdir(parents=True, exist_ok=True)
 
     model_order = list(predictions.keys())
     first       = predictions[model_order[0]]
@@ -224,7 +228,7 @@ def generate_report_figures(
         fontsize=13, fontweight="bold", y=0.97,
     )
 
-    out_path = REPORT_DIR / "evaluation_dashboard.png"
+    out_path = report_dir / "evaluation_dashboard.png"
     if save:
         fig.savefig(out_path, bbox_inches="tight")
         logger.info(f"Dashboard saved: {out_path}")
@@ -288,6 +292,7 @@ def generate_narrative(
     mcs_result: dict,
     target_col: str = "price_well_milled",
     save:       bool = True,
+    report_dir: Path = REPORT_DIR,
 ) -> str:
     """
     Calls the Anthropic Messages API and returns a plain-English explanation
@@ -328,8 +333,8 @@ def generate_narrative(
         narrative = _fallback_narrative(metrics_df, dm_df, mcs_result, target_col)
 
     if save:
-        REPORT_DIR.mkdir(parents=True, exist_ok=True)
-        out_path = REPORT_DIR / "narrative_summary.txt"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        out_path = report_dir / "narrative_summary.txt"
         out_path.write_text(narrative, encoding="utf-8")
         logger.info(f"Narrative saved: {out_path}")
 
@@ -391,6 +396,7 @@ def run_report(
     dm_df:       pd.DataFrame,
     mcs_result:  dict,
     target_col:  str = "price_well_milled",
+    report_dir:  Path = REPORT_DIR,
 ) -> dict:
     """
     Convenience wrapper that:
@@ -405,6 +411,8 @@ def run_report(
     dm_df       : DataFrame from run_pairwise_dm()
     mcs_result  : dict from model_confidence_set()
     target_col  : name of the target column (for labelling)
+    report_dir  : where to write the dashboard/narrative (lets callers
+                  scope output per target / experiment variant)
 
     Returns
     -------
@@ -415,11 +423,11 @@ def run_report(
     logger.info("━" * 55)
 
     dashboard_path = generate_report_figures(
-        predictions, metrics_df, dm_df, mcs_result, target_col
+        predictions, metrics_df, dm_df, mcs_result, target_col, report_dir=report_dir
     )
 
     narrative = generate_narrative(
-        metrics_df, dm_df, mcs_result, target_col
+        metrics_df, dm_df, mcs_result, target_col, report_dir=report_dir
     )
 
     logger.info("─" * 55)
@@ -428,7 +436,7 @@ def run_report(
     for line in narrative.split("\n"):
         logger.info(line)
     logger.info("─" * 55)
-    logger.info(f"Report saved to: {REPORT_DIR}")
+    logger.info(f"Report saved to: {report_dir}")
 
     return {
         "dashboard_path": dashboard_path,
